@@ -1,0 +1,22 @@
+appId: com.screenhalf.app
+productName: screen-half
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+asarUnpack:
+  - '**/node_modules/ffmpeg-static/**'
+  - '**/node_modules/uiohook-napi/**'
+win:
+  target: nsis
+  artifactName: ${productName}-${version}-setup.${ext}
+mac:
+  target: dmg
+  category: public.app-category.video
+linux:
+  target: AppImage
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
