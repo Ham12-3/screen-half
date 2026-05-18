@@ -184,20 +184,47 @@ export interface RecordingPaths {
 export interface Api {
   getSources(): Promise<CaptureSource[]>
   startInputTracking(
-    displayId: number
+    displayId: number,
+    eventsPath: string
   ): Promise<{ ok: boolean; tracked: boolean; t0EpochMs: number }>
-  stopInputTracking(): Promise<EventLog>
+  /** Stops tracking; events were streamed to disk during recording. */
+  stopInputTracking(): Promise<{ eventCount: number }>
   createSession(): Promise<RecordingPaths>
   getSessionPaths(sessionId: string): Promise<RecordingPaths>
-  saveBlob(absPath: string, data: ArrayBuffer): Promise<void>
   writeJson(absPath: string, value: unknown): Promise<void>
   readJson<T>(absPath: string): Promise<T>
   listSessions(): Promise<string[]>
+  /**
+   * Open an append-only write stream for a recording file. Returns an
+   * opaque handle; chunks are streamed in with {@link recordAppend}.
+   */
+  recordOpen(absPath: string): Promise<number>
+  /** Append the next MediaRecorder chunk; resolves once it is on disk. */
+  recordAppend(handle: number, chunk: ArrayBuffer): Promise<void>
+  /** Flush and close a recording stream. */
+  recordClose(handle: number): Promise<void>
+  /**
+   * Open a seekable file for streaming muxer output (mediabunny may write
+   * boxes out of order, e.g. patching the mdat size header).
+   */
+  exportOpen(absPath: string): Promise<number>
+  /** Write muxer bytes at an absolute file offset. */
+  exportWrite(
+    handle: number,
+    data: ArrayBuffer,
+    position: number
+  ): Promise<void>
+  /** Close a streaming export file. */
+  exportClose(handle: number): Promise<void>
+  /** Free bytes on the volume that holds recordings. */
+  getFreeDiskBytes(): Promise<number>
   muxAudioToMp4(args: {
     videoPath: string
     audioPath: string
     outPath: string
   }): Promise<string>
+  /** Resolve a (collision-safe) path in the OS Downloads folder. */
+  getDownloadsExportPath(fileName: string): Promise<string>
 }
 
 declare global {

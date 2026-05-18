@@ -1,10 +1,11 @@
 import {
   ALL_FORMATS,
-  BufferTarget,
   CanvasSource,
   Input,
   Mp4OutputFormat,
   Output,
+  StreamTarget,
+  type StreamTargetChunk,
   UrlSource,
   VideoSampleSink
 } from 'mediabunny'
@@ -34,6 +35,77 @@ function settingsOf(p: ProjectFile): ExportSettings {
 function bitrateFor(w: number, h: number, fps: number): number {
   const bpp = 0.18
   return Math.min(60_000_000, Math.max(8_000_000, Math.round(w * h * fps * bpp)))
+}
+
+/**
+ * Mux straight to a file on disk via a mediabunny StreamTarget instead of a
+ * BufferTarget, so export RAM stays flat no matter how long the output is.
+ * `chunked: true` batches writes (~16 MiB) to keep IPC chatter low, and the
+ * main-process file handle accepts the muxer's occasional seek-backs (e.g.
+ * patching the mdat size). The recorded mic audio is attached afterwards by
+ * the existing FFmpeg step, exactly as before.
+ */
+async function streamingMp4(
+  sessionId: string,
+  canvas: HTMLCanvasElement,
+  s: ExportSettings
+): Promise<{ canvasSource: CanvasSource; finish: () => Promise<string> }> {
+  const fps = s.fps || 30
+  const paths = await window.api.getSessionPaths(sessionId)
+  const videoOnly = `${paths.dir}/render_video.mp4`
+  const handle = await window.api.exportOpen(videoOnly)
+
+  let closed = false
+  const closeFile = async (): Promise<void> => {
+    if (closed) return
+    closed = true
+    await window.api.exportClose(handle)
+  }
+
+  const writable = new WritableStream<StreamTargetChunk>({
+    async write(chunk) {
+      // slice() → an exactly-sized copy so IPC structured-clone doesn't
+      // ship mediabunny's whole backing buffer.
+      await window.api.exportWrite(
+        handle,
+        chunk.data.slice().buffer,
+        chunk.position
+      )
+    },
+    abort() {
+      void closeFile()
+    }
+  })
+
+  const output = new Output({
+    format: new Mp4OutputFormat(),
+    target: new StreamTarget(writable, { chunked: true })
+  })
+  const canvasSource = new CanvasSource(canvas, {
+    codec: 'avc',
+    bitrate: bitrateFor(s.width, s.height, fps),
+    keyFrameInterval: 2
+  })
+  output.addVideoTrack(canvasSource, { frameRate: fps })
+  await output.start()
+
+  const finish = async (): Promise<string> => {
+    try {
+      await output.finalize()
+    } finally {
+      await closeFile()
+    }
+    const finalPath = await window.api.getDownloadsExportPath(
+      `screen-half-${sessionId}.mp4`
+    )
+    return window.api.muxAudioToMp4({
+      videoPath: videoOnly,
+      audioPath: paths.webcamPath,
+      outPath: finalPath
+    })
+  }
+
+  return { canvasSource, finish }
 }
 
 /**
@@ -80,71 +152,83 @@ async function exportViaMediabunny(inputs: ExportInputs): Promise<string> {
   const ctx = canvas.getContext('2d', { alpha: false })
   if (!ctx) throw new Error('2D canvas unavailable')
 
-  const output = new Output({
-    format: new Mp4OutputFormat(),
-    target: new BufferTarget()
-  })
-  const canvasSource = new CanvasSource(canvas, {
-    codec: 'avc',
-    bitrate: bitrateFor(s.width, s.height, fps),
-    keyFrameInterval: 2
-  })
-  output.addVideoTrack(canvasSource, { frameRate: fps })
-  await output.start()
+  const { canvasSource, finish } = await streamingMp4(
+    project.sessionId,
+    canvas,
+    s
+  )
 
+  // Precompute every output timestamp (seconds). Feeding the whole sorted
+  // list to samplesAtTimestamps lets mediabunny decode sequentially through
+  // each track (every packet at most once) — robust for MediaRecorder WebM
+  // which has no seek index, and fast. Per-frame getSample() instead does
+  // fragile random access and was returning the same webcam frame forever.
+  const timestamps: number[] = []
   for (let i = 0; i < totalFrames; i++) {
-    const tMs = trimIn + (i * 1000) / fps
-    const tSec = tMs / 1000
-    const [ss, ws] = await Promise.all([
-      screenSink.getSample(tSec),
-      webcamSink ? webcamSink.getSample(tSec) : Promise.resolve(null)
-    ])
-    const sFrame = ss ? ss.toVideoFrame() : null
-    const wFrame = ws ? ws.toVideoFrame() : null
-
-    drawComposite(ctx, {
-      screen: sFrame
-        ? {
-            img: sFrame,
-            w: screenW,
-            h: screenH,
-            region: project.region
-          }
-        : null,
-      webcam: wFrame
-        ? { img: wFrame, w: webcamW, h: webcamH }
-        : null,
-      layout: project.layout,
-      segments: project.zoomSegments,
-      tMs,
-      outW: s.width,
-      outH: s.height
-    })
-
-    await canvasSource.add(i / fps, 1 / fps)
-
-    sFrame?.close()
-    wFrame?.close()
-    ss?.close()
-    ws?.close()
-    inputs.onProgress?.((i + 1) / totalFrames)
+    timestamps.push((trimIn + (i * 1000) / fps) / 1000)
   }
 
-  await output.finalize()
+  const screenIt = screenSink.samplesAtTimestamps(timestamps)
+  const webcamIt = webcamSink
+    ? webcamSink.samplesAtTimestamps(timestamps)
+    : null
+
+  // Hold the most recent decoded frame so a null (no new frame at this
+  // timestamp) reuses the last one instead of dropping to black.
+  let lastScreen: VideoFrame | null = null
+  let lastWebcam: VideoFrame | null = null
+
+  try {
+    for (let i = 0; i < totalFrames; i++) {
+      const tMs = trimIn + (i * 1000) / fps
+
+      const sRes = await screenIt.next()
+      const sSample = sRes.done ? null : sRes.value
+      if (sSample) {
+        lastScreen?.close()
+        lastScreen = sSample.toVideoFrame()
+        sSample.close()
+      }
+
+      const wRes = webcamIt ? await webcamIt.next() : null
+      const wSample = wRes && !wRes.done ? wRes.value : null
+      if (wSample) {
+        lastWebcam?.close()
+        lastWebcam = wSample.toVideoFrame()
+        wSample.close()
+      }
+
+      drawComposite(ctx, {
+        screen: lastScreen
+          ? {
+              img: lastScreen,
+              w: screenW,
+              h: screenH,
+              region: project.region
+            }
+          : null,
+        webcam: lastWebcam
+          ? { img: lastWebcam, w: webcamW, h: webcamH }
+          : null,
+        layout: project.layout,
+        segments: project.zoomSegments,
+        tMs,
+        outW: s.width,
+        outH: s.height
+      })
+
+      await canvasSource.add(i / fps, 1 / fps)
+      inputs.onProgress?.((i + 1) / totalFrames)
+    }
+  } finally {
+    await screenIt.return?.(undefined)
+    await webcamIt?.return?.(undefined)
+    lastScreen?.close()
+    lastWebcam?.close()
+  }
+
   await Promise.all([screenInput.dispose(), webcamInput.dispose()])
-
-  const buffer = output.target.buffer
-  if (!buffer) throw new Error('Muxer produced no output')
-
-  const paths = await window.api.getSessionPaths(project.sessionId)
-  const videoOnly = `${paths.dir}/render_video.mp4`
-  const finalPath = `${paths.dir}/export.mp4`
-  await window.api.saveBlob(videoOnly, buffer)
-  return window.api.muxAudioToMp4({
-    videoPath: videoOnly,
-    audioPath: paths.webcamPath,
-    outPath: finalPath
-  })
+  return finish()
 }
 
 // ---- Fallback: <video> seek path (slower, used only if mediabunny fails) ----
@@ -196,17 +280,11 @@ async function exportViaVideoSeek(inputs: ExportInputs): Promise<string> {
   const ctx = canvas.getContext('2d', { alpha: false })
   if (!ctx) throw new Error('2D canvas unavailable')
 
-  const output = new Output({
-    format: new Mp4OutputFormat(),
-    target: new BufferTarget()
-  })
-  const canvasSource = new CanvasSource(canvas, {
-    codec: 'avc',
-    bitrate: bitrateFor(s.width, s.height, fps),
-    keyFrameInterval: 2
-  })
-  output.addVideoTrack(canvasSource, { frameRate: fps })
-  await output.start()
+  const { canvasSource, finish } = await streamingMp4(
+    project.sessionId,
+    canvas,
+    s
+  )
 
   for (let i = 0; i < totalFrames; i++) {
     const tMs = trimIn + (i * 1000) / fps
@@ -236,19 +314,7 @@ async function exportViaVideoSeek(inputs: ExportInputs): Promise<string> {
     inputs.onProgress?.((i + 1) / totalFrames)
   }
 
-  await output.finalize()
-  const buffer = output.target.buffer
-  if (!buffer) throw new Error('Muxer produced no output')
-
-  const paths = await window.api.getSessionPaths(project.sessionId)
-  const videoOnly = `${paths.dir}/render_video.mp4`
-  const finalPath = `${paths.dir}/export.mp4`
-  await window.api.saveBlob(videoOnly, buffer)
-  return window.api.muxAudioToMp4({
-    videoPath: videoOnly,
-    audioPath: paths.webcamPath,
-    outPath: finalPath
-  })
+  return finish()
 }
 
 export async function exportProject(

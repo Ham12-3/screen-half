@@ -46,10 +46,14 @@ export function streamSize(stream: MediaStream): {
   }
 }
 
-export function recordScreen(stream: MediaStream): ActiveRecorder {
+export function recordScreen(
+  stream: MediaStream,
+  onChunk: (chunk: ArrayBuffer) => Promise<void>
+): ActiveRecorder {
   return startRecorder(
     stream,
     ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'],
-    12_000_000
+    12_000_000,
+    onChunk
   )
 }

@@ -1,5 +1,7 @@
 import { screen } from 'electron'
-import type { EventLog, InputEvent } from '@shared/types'
+import type { InputEvent } from '@shared/types'
+import { EventSink } from './event-sink'
+import { assertInsideRecordings } from './storage'
 
 /**
  * Wraps uiohook-napi (global mouse hooks). Isolated here because it is the
@@ -9,8 +11,12 @@ import type { EventLog, InputEvent } from '@shared/types'
  */
 
 interface Tracker {
-  start(displayId: number): { tracked: boolean; t0EpochMs: number }
-  stop(): EventLog
+  start(
+    displayId: number,
+    eventsPath: string
+  ): { tracked: boolean; t0EpochMs: number }
+  /** Resolves with the total number of events streamed to disk. */
+  stop(): Promise<number>
 }
 
 interface DisplayPixelBox {
@@ -34,7 +40,7 @@ function displayPixelBox(displayId: number): DisplayPixelBox {
 }
 
 class UiohookTracker implements Tracker {
-  private events: InputEvent[] = []
+  private sink = new EventSink()
   private t0 = 0
   private box: DisplayPixelBox = { x: 0, y: 0, w: 1, h: 1 }
   private running = false
@@ -61,11 +67,14 @@ class UiohookTracker implements Tracker {
     const y = (rawY - this.box.y) / this.box.h
     // Drop events that landed on another monitor.
     if (x < 0 || x > 1 || y < 0 || y > 1) return
-    this.events.push({ t, type, x, y, button })
+    this.sink.push({ t, type, x, y, button })
   }
 
-  start(displayId: number): { tracked: boolean; t0EpochMs: number } {
-    this.events = []
+  start(
+    displayId: number,
+    eventsPath: string
+  ): { tracked: boolean; t0EpochMs: number } {
+    this.sink.start(eventsPath)
     this.lastMoveT = -1
     this.box = displayPixelBox(displayId)
     this.t0 = Date.now()
@@ -83,7 +92,7 @@ class UiohookTracker implements Tracker {
     return { tracked: true, t0EpochMs: this.t0 }
   }
 
-  stop(): EventLog {
+  async stop(): Promise<number> {
     if (this.running) {
       try {
         this.uio.stop()
@@ -93,18 +102,21 @@ class UiohookTracker implements Tracker {
       this.uio.removeAllListeners()
       this.running = false
     }
-    return { version: 1, events: this.events }
+    return this.sink.finalize()
   }
 }
 
 class PollingTracker implements Tracker {
-  private events: InputEvent[] = []
+  private sink = new EventSink()
   private t0 = 0
   private box: DisplayPixelBox = { x: 0, y: 0, w: 1, h: 1 }
   private timer: NodeJS.Timeout | null = null
 
-  start(displayId: number): { tracked: boolean; t0EpochMs: number } {
-    this.events = []
+  start(
+    displayId: number,
+    eventsPath: string
+  ): { tracked: boolean; t0EpochMs: number } {
+    this.sink.start(eventsPath)
     this.box = displayPixelBox(displayId)
     this.t0 = Date.now()
     this.timer = setInterval(() => {
@@ -114,15 +126,15 @@ class PollingTracker implements Tracker {
       const x = (p.x * s - this.box.x) / this.box.w
       const y = (p.y * s - this.box.y) / this.box.h
       if (x < 0 || x > 1 || y < 0 || y > 1) return
-      this.events.push({ t: Date.now() - this.t0, type: 'move', x, y })
+      this.sink.push({ t: Date.now() - this.t0, type: 'move', x, y })
     }, 33)
     return { tracked: true, t0EpochMs: this.t0 }
   }
 
-  stop(): EventLog {
+  async stop(): Promise<number> {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
-    return { version: 1, events: this.events }
+    return this.sink.finalize()
   }
 }
 
@@ -138,20 +150,27 @@ function makeTracker(): Tracker {
   }
 }
 
-export function startInputTracking(displayId: number): {
-  ok: boolean
-  tracked: boolean
-  t0EpochMs: number
-} {
-  if (active) active.stop()
+export async function startInputTracking(
+  displayId: number,
+  eventsPath: string
+): Promise<{ ok: boolean; tracked: boolean; t0EpochMs: number }> {
+  assertInsideRecordings(eventsPath)
+  if (active) {
+    try {
+      await active.stop()
+    } catch {
+      /* a dangling tracker shouldn't block a new recording */
+    }
+  }
   active = makeTracker()
-  const { tracked, t0EpochMs } = active.start(displayId)
+  const { tracked, t0EpochMs } = active.start(displayId, eventsPath)
   return { ok: true, tracked, t0EpochMs }
 }
 
-export function stopInputTracking(): EventLog {
-  if (!active) return { version: 1, events: [] }
-  const log = active.stop()
+export async function stopInputTracking(): Promise<{ eventCount: number }> {
+  if (!active) return { eventCount: 0 }
+  const t = active
   active = null
-  return log
+  const eventCount = await t.stop()
+  return { eventCount }
 }

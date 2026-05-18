@@ -143,12 +143,12 @@ export function EditorPage({ project, onBack }: Props): JSX.Element {
         } else {
           playheadRef.current = tMs
           if (playing) setPlayheadMs(tMs)
-          if (
-            wv &&
-            Math.abs(wv.currentTime - sv.currentTime) > 0.18
-          ) {
-            wv.currentTime = sv.currentTime
-          }
+          // Do NOT re-seek the webcam here. These are MediaRecorder WebM
+          // files with no seek index, so assigning currentTime every frame
+          // makes the webcam perpetually re-seek and never play (it looks
+          // frozen). Both videos start together on play and on seek, which
+          // keeps them visually in sync for the preview; the export is
+          // frame-exact regardless.
         }
       }
       raf = requestAnimationFrame(loop)
@@ -290,7 +290,7 @@ export function EditorPage({ project, onBack }: Props): JSX.Element {
         onProgress: (f) =>
           setExportState(`Exporting… ${Math.round(f * 100)}%`)
       })
-      setExportState(`Saved: ${out}`)
+      setExportState(`Saved to Downloads: ${out}`)
     } catch (e) {
       setExportState(`Export failed: ${String(e)}`)
     }
@@ -341,6 +341,19 @@ export function EditorPage({ project, onBack }: Props): JSX.Element {
         muted
         playsInline
         preload="auto"
+        onLoadedMetadata={(e) => {
+          // A hidden, never-played video may not decode a frame until it
+          // seeks — nudge it so the preview has something to draw.
+          const v = e.currentTarget
+          if (v.currentTime === 0) v.currentTime = 0.001
+        }}
+        onError={() =>
+          setExportState(
+            `Screen video failed to load (code ${
+              screenRef.current?.error?.code ?? '?'
+            }). The recording may be missing or unreadable.`
+          )
+        }
         style={{ display: 'none' }}
       />
       <video
@@ -354,7 +367,15 @@ export function EditorPage({ project, onBack }: Props): JSX.Element {
           const v = e.currentTarget
           if (v.videoWidth)
             setWcSize({ w: v.videoWidth, h: v.videoHeight })
+          if (v.currentTime === 0) v.currentTime = 0.001
         }}
+        onError={() =>
+          setExportState(
+            `Webcam video failed to load (code ${
+              webcamRef.current?.error?.code ?? '?'
+            }).`
+          )
+        }
         style={{ display: 'none' }}
       />
 

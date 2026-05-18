@@ -2,9 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   DEFAULT_LAYOUT,
   type CaptureSource,
-  type EventLog,
   type Meta,
-  type ProjectFile
+  type ProjectFile,
+  type RecordingPaths
 } from '@shared/types'
 import {
   captureScreen,
@@ -24,6 +24,10 @@ interface Props {
 
 const FPS = 30
 
+// Recording costs ~8 GB/hour (12 Mbps screen + 6 Mbps webcam). Warn once
+// free space drops below roughly an hour of headroom.
+const LOW_DISK_BYTES = 8 * 1024 ** 3
+
 type Phase = 'idle' | 'recording' | 'saving'
 
 export function RecordPage({ onRecorded }: Props): JSX.Element {
@@ -36,10 +40,15 @@ export function RecordPage({ onRecorded }: Props): JSX.Element {
   const [phase, setPhase] = useState<Phase>('idle')
   const [elapsed, setElapsed] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [warning, setWarning] = useState<string | null>(null)
 
   const webcamPreviewRef = useRef<HTMLVideoElement>(null)
   const screenRecRef = useRef<ActiveRecorder | null>(null)
   const webcamRecRef = useRef<ActiveRecorder | null>(null)
+  const sessionRef = useRef<RecordingPaths | null>(null)
+  const screenHandleRef = useRef<number | null>(null)
+  const webcamHandleRef = useRef<number | null>(null)
+  const diskTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const screenSizeRef = useRef<{ width: number; height: number }>({
     width: 1920,
     height: 1080
@@ -91,16 +100,52 @@ export function RecordPage({ onRecorded }: Props): JSX.Element {
     return scr?.display?.displayId ?? 0
   }, [sources])
 
+  const checkDisk = useCallback(async () => {
+    try {
+      const free = await window.api.getFreeDiskBytes()
+      if (free < LOW_DISK_BYTES) {
+        setWarning(
+          `Low disk space: ${(free / 1024 ** 3).toFixed(1)} GB free. ` +
+            'Recording uses ~8 GB/hour and will stop if the disk fills.'
+        )
+      } else {
+        setWarning(null)
+      }
+    } catch {
+      /* probing free space is best-effort — never block recording */
+    }
+  }, [])
+
+  const stopDiskWatch = useCallback(() => {
+    if (diskTimerRef.current) {
+      clearInterval(diskTimerRef.current)
+      diskTimerRef.current = null
+    }
+    setWarning(null)
+  }, [])
+
+  // Clean up timers if the page unmounts mid-recording.
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearInterval(timerRef.current)
+      if (diskTimerRef.current) clearInterval(diskTimerRef.current)
+    },
+    []
+  )
+
   const start = useCallback(async () => {
     setError(null)
+    void checkDisk()
     const source = sources.find((s) => s.sourceId === sourceId)
     if (!source) {
       setError('Pick a screen or window to record.')
       return
     }
+    let screenStream: MediaStream | null = null
+    let webcamStream: MediaStream | null = null
     try {
-      const screenStream = await captureScreen(source, FPS)
-      const webcamStream = await captureWebcam({
+      screenStream = await captureScreen(source, FPS)
+      webcamStream = await captureWebcam({
         videoDeviceId: cameraId || undefined,
         audioDeviceId: micId || undefined
       })
@@ -117,50 +162,102 @@ export function RecordPage({ onRecorded }: Props): JSX.Element {
       }
       sourceRef.current = source
 
+      // Create the session and open the on-disk streams up front so every
+      // MediaRecorder chunk is written straight to disk — nothing is held
+      // in RAM, so recording length is bounded by disk, not memory.
+      const session = await window.api.createSession()
+      sessionRef.current = session
+      const screenHandle = await window.api.recordOpen(session.screenPath)
+      screenHandleRef.current = screenHandle
+      const webcamHandle = await window.api.recordOpen(session.webcamPath)
+      webcamHandleRef.current = webcamHandle
+
       // Screen sources map the cursor to their own display (exact). Window
       // sources have no bounds, so fall back to the primary display.
       const trackDisplayId =
         source.kind === 'screen' && source.display
           ? source.display.displayId
           : primaryDisplayId()
-      const track = await window.api.startInputTracking(trackDisplayId)
+      const track = await window.api.startInputTracking(
+        trackDisplayId,
+        session.eventsPath
+      )
       t0Ref.current = track.t0EpochMs
 
-      screenRecRef.current = recordScreen(screenStream)
-      webcamRecRef.current = recordWebcam(webcamStream)
+      screenRecRef.current = recordScreen(screenStream, (chunk) =>
+        window.api.recordAppend(screenHandle, chunk)
+      )
+      webcamRecRef.current = recordWebcam(webcamStream, (chunk) =>
+        window.api.recordAppend(webcamHandle, chunk)
+      )
 
       setPhase('recording')
       setElapsed(0)
       timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000)
+      diskTimerRef.current = setInterval(() => void checkDisk(), 20000)
     } catch (e) {
-      setError(`Could not start capture: ${String(e)}`)
+      // Don't leave a half-opened device/stream/session running on failure.
+      screenStream?.getTracks().forEach((t) => t.stop())
+      webcamStream?.getTracks().forEach((t) => t.stop())
+      screenRecRef.current = null
+      webcamRecRef.current = null
+      if (screenHandleRef.current != null) {
+        await window.api.recordClose(screenHandleRef.current).catch(() => {})
+        screenHandleRef.current = null
+      }
+      if (webcamHandleRef.current != null) {
+        await window.api.recordClose(webcamHandleRef.current).catch(() => {})
+        webcamHandleRef.current = null
+      }
+      await window.api.stopInputTracking().catch(() => {})
+      sessionRef.current = null
+      const name = (e as DOMException)?.name
+      if (name === 'NotReadableError' || name === 'AbortError') {
+        setError(
+          'Could not start the camera — it looks like another app is ' +
+            'using it (Zoom, Teams, Camera, a browser tab, etc.). Close ' +
+            'that app, or unplug/replug the webcam, then try again. You ' +
+            'can also pick a different camera above.'
+        )
+      } else if (name === 'NotAllowedError') {
+        setError(
+          'Camera/microphone permission was denied. Allow access in ' +
+            'Windows Settings → Privacy → Camera, then try again.'
+        )
+      } else {
+        setError(`Could not start capture: ${String(e)}`)
+      }
     }
-  }, [sources, sourceId, cameraId, micId, primaryDisplayId])
+  }, [sources, sourceId, cameraId, micId, primaryDisplayId, checkDisk])
 
   const stop = useCallback(async () => {
     if (!screenRecRef.current || !webcamRecRef.current) return
     setPhase('saving')
     if (timerRef.current) clearInterval(timerRef.current)
+    stopDiskWatch()
 
     try {
       const source = sourceRef.current
-      const [screenBlob, webcamBlob] = await Promise.all([
+      const session = sessionRef.current
+      if (!session) throw new Error('No active recording session')
+
+      // Stop the recorders (final chunk is flushed before this resolves),
+      // then close the on-disk streams and the input log.
+      await Promise.all([
         screenRecRef.current.stop(),
         webcamRecRef.current.stop()
       ])
-      const eventLog: EventLog = await window.api.stopInputTracking()
+      await Promise.all([
+        screenHandleRef.current != null
+          ? window.api.recordClose(screenHandleRef.current)
+          : Promise.resolve(),
+        webcamHandleRef.current != null
+          ? window.api.recordClose(webcamHandleRef.current)
+          : Promise.resolve()
+      ])
+      // events.json was streamed to disk during recording by the tracker.
+      const { eventCount } = await window.api.stopInputTracking()
       const durationMs = Date.now() - t0Ref.current
-
-      const session = await window.api.createSession()
-      await window.api.saveBlob(
-        session.screenPath,
-        await screenBlob.arrayBuffer()
-      )
-      await window.api.saveBlob(
-        session.webcamPath,
-        await webcamBlob.arrayBuffer()
-      )
-      await window.api.writeJson(session.eventsPath, eventLog)
 
       const meta: Meta = {
         version: 1,
@@ -184,7 +281,7 @@ export function RecordPage({ onRecorded }: Props): JSX.Element {
         },
         sourceKind: source?.kind ?? 'screen',
         display: source?.display,
-        inputTracked: eventLog.events.length > 0
+        inputTracked: eventCount > 0
       }
       await window.api.writeJson(session.metaPath, meta)
 
@@ -200,13 +297,16 @@ export function RecordPage({ onRecorded }: Props): JSX.Element {
       await window.api.writeJson(session.projectPath, project)
       screenRecRef.current = null
       webcamRecRef.current = null
+      screenHandleRef.current = null
+      webcamHandleRef.current = null
+      sessionRef.current = null
       setPhase('idle')
       onRecorded(project)
     } catch (e) {
       setError(`Could not save recording: ${String(e)}`)
       setPhase('idle')
     }
-  }, [onRecorded])
+  }, [onRecorded, stopDiskWatch])
 
   const fmt = (s: number): string =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(
@@ -245,6 +345,9 @@ export function RecordPage({ onRecorded }: Props): JSX.Element {
         <h2 style={{ marginTop: 0 }}>Record</h2>
 
         {error && <p style={{ color: 'var(--danger)' }}>{error}</p>}
+        {warning && (
+          <p style={{ color: 'var(--warn, #d08700)' }}>{warning}</p>
+        )}
 
         <div className="field">
           <label>Screens</label>

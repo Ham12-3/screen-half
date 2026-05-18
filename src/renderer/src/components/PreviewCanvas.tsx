@@ -50,6 +50,12 @@ export function PreviewCanvas({
     const ready = (v: HTMLVideoElement | null): v is HTMLVideoElement =>
       !!v && v.readyState >= 2
 
+    const status = (v: HTMLVideoElement | null): string => {
+      if (!v) return 'no element'
+      if (v.error) return `error code ${v.error.code}`
+      return `loading… (readyState ${v.readyState})`
+    }
+
     const loop = (): void => {
       const s = stateRef.current
       const sv = screenRef.current
@@ -72,6 +78,25 @@ export function PreviewCanvas({
         outW: OUTPUT_WIDTH,
         outH: OUTPUT_HEIGHT
       })
+
+      // Surface why a half is black instead of failing silently.
+      ctx.font = '34px sans-serif'
+      ctx.fillStyle = '#ff9bb0'
+      ctx.textAlign = 'center'
+      if (!ready(sv)) {
+        ctx.fillText(
+          `Screen: ${status(sv)}`,
+          OUTPUT_WIDTH / 2,
+          OUTPUT_HEIGHT * 0.25
+        )
+      }
+      if (!ready(wv)) {
+        ctx.fillText(
+          `Webcam: ${status(wv)}`,
+          OUTPUT_WIDTH / 2,
+          OUTPUT_HEIGHT * 0.75
+        )
+      }
       raf = requestAnimationFrame(loop)
     }
     raf = requestAnimationFrame(loop)
